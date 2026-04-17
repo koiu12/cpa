@@ -20,15 +20,20 @@ RUN apk add --no-cache tzdata
 
 RUN mkdir /CLIProxyAPI
 
+RUN mkdir -p /CLIProxyAPI/writable/static
+
 COPY --from=builder ./app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
 
 COPY config.example.yaml /CLIProxyAPI/config.example.yaml
+
+COPY docker-management.html /CLIProxyAPI/writable/static/management.html
 
 WORKDIR /CLIProxyAPI
 
 EXPOSE 8317
 
 ENV TZ=Asia/Shanghai
+ENV WRITABLE_PATH=/CLIProxyAPI/writable
 
 RUN cp /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone
 

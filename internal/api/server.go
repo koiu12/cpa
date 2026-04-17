@@ -512,6 +512,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
+		mgmt.POST("/api-call/batch", s.mgmt.BatchAPICall)
+		mgmt.POST("/auth-files/check", s.mgmt.BatchCheckAuthFiles)
 
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)

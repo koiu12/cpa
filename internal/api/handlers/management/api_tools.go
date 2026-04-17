@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -54,6 +55,39 @@ type apiCallResponse struct {
 	StatusCode int                 `json:"status_code"`
 	Header     map[string][]string `json:"header"`
 	Body       string              `json:"body"`
+}
+
+type batchAPICallItem struct {
+	Name            string            `json:"name,omitempty"`
+	AuthIndexSnake  *string           `json:"auth_index,omitempty"`
+	AuthIndexCamel  *string           `json:"authIndex,omitempty"`
+	AuthIndexPascal *string           `json:"AuthIndex,omitempty"`
+	Method          string            `json:"method"`
+	URL             string            `json:"url"`
+	Header          map[string]string `json:"header,omitempty"`
+	Data            string            `json:"data,omitempty"`
+	UpdateStatus    bool              `json:"update_status,omitempty"`
+}
+
+type batchAPICallRequest struct {
+	Items []batchAPICallItem `json:"items"`
+}
+
+type batchAPICallResult struct {
+	Name       string              `json:"name,omitempty"`
+	AuthIndex  string              `json:"auth_index,omitempty"`
+	Status     string              `json:"status"`
+	Error      string              `json:"error,omitempty"`
+	StatusCode int                 `json:"status_code,omitempty"`
+	Header     map[string][]string `json:"header,omitempty"`
+	Body       string              `json:"body,omitempty"`
+}
+
+type batchAuthCheckRequest struct {
+	AuthIndexes  []string `json:"auth_indexes,omitempty"`
+	Names        []string `json:"names,omitempty"`
+	IncludeAll   bool     `json:"include_all,omitempty"`
+	UpdateStatus bool     `json:"update_status,omitempty"`
 }
 
 // APICall makes a generic HTTP request on behalf of the management API caller.
@@ -214,6 +248,428 @@ func (h *Handler) APICall(c *gin.Context) {
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+// BatchAPICall executes multiple management API calls in one request.
+// It can also be used for bulk auth liveness checks by setting update_status=true
+// so each result is reflected back into the auth runtime status.
+func (h *Handler) BatchAPICall(c *gin.Context) {
+	var body batchAPICallRequest
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if len(body.Items) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "items is required"})
+		return
+	}
+
+	results := make([]batchAPICallResult, 0, len(body.Items))
+	for _, item := range body.Items {
+		result := h.executeBatchAPICallItem(c.Request.Context(), item)
+		results = append(results, result)
+	}
+
+	status := http.StatusOK
+	hasFailure := false
+	hasSuccess := false
+	for _, item := range results {
+		if item.Status == "ok" {
+			hasSuccess = true
+			continue
+		}
+		hasFailure = true
+	}
+	if hasFailure && hasSuccess {
+		status = http.StatusMultiStatus
+	} else if hasFailure {
+		status = http.StatusBadGateway
+	}
+
+	c.JSON(status, gin.H{"items": results})
+}
+
+// BatchCheckAuthFiles performs a bulk liveness probe for multiple auth entries.
+func (h *Handler) BatchCheckAuthFiles(c *gin.Context) {
+	var body batchAuthCheckRequest
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+
+	targets := h.resolveBatchCheckTargets(body)
+	if len(targets) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no auth targets provided"})
+		return
+	}
+
+	results := make([]batchAPICallResult, 0, len(targets))
+	for _, auth := range targets {
+		results = append(results, h.checkSingleAuth(c.Request.Context(), auth, body.UpdateStatus))
+	}
+
+	status := http.StatusOK
+	hasFailure := false
+	hasSuccess := false
+	for _, item := range results {
+		if item.Status == "ok" {
+			hasSuccess = true
+			continue
+		}
+		hasFailure = true
+	}
+	if hasFailure && hasSuccess {
+		status = http.StatusMultiStatus
+	} else if hasFailure {
+		status = http.StatusBadGateway
+	}
+
+	c.JSON(status, gin.H{"items": results})
+}
+
+func (h *Handler) executeBatchAPICallItem(ctx context.Context, item batchAPICallItem) batchAPICallResult {
+	authIndex := firstNonEmptyString(item.AuthIndexSnake, item.AuthIndexCamel, item.AuthIndexPascal)
+	result := batchAPICallResult{
+		Name:      strings.TrimSpace(item.Name),
+		AuthIndex: authIndex,
+		Status:    "error",
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	method := strings.ToUpper(strings.TrimSpace(item.Method))
+	if method == "" {
+		result.Error = "missing method"
+		return result
+	}
+
+	urlStr := strings.TrimSpace(item.URL)
+	if urlStr == "" {
+		result.Error = "missing url"
+		return result
+	}
+	parsedURL, errParseURL := url.Parse(urlStr)
+	if errParseURL != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		result.Error = "invalid url"
+		return result
+	}
+
+	auth := h.authByIdentifier(authIndex, result.Name)
+	if auth != nil {
+		auth.EnsureIndex()
+		result.Name = authDisplayName(auth)
+		result.AuthIndex = auth.Index
+	}
+
+	reqHeaders := item.Header
+	if reqHeaders == nil {
+		reqHeaders = map[string]string{}
+	}
+
+	var hostOverride string
+	var token string
+	var tokenResolved bool
+	var tokenErr error
+	for key, value := range reqHeaders {
+		if !strings.Contains(value, "$TOKEN$") {
+			continue
+		}
+		if !tokenResolved {
+			token, tokenErr = h.resolveTokenForAuth(ctx, auth)
+			tokenResolved = true
+		}
+		if auth != nil && token == "" {
+			if tokenErr != nil {
+				result.Error = "auth token refresh failed"
+				h.updateAuthProbeStatus(ctx, auth, result, item.UpdateStatus)
+				return result
+			}
+			result.Error = "auth token not found"
+			h.updateAuthProbeStatus(ctx, auth, result, item.UpdateStatus)
+			return result
+		}
+		if token == "" {
+			continue
+		}
+		reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", token)
+	}
+
+	var requestBody io.Reader
+	if item.Data != "" {
+		requestBody = strings.NewReader(item.Data)
+	}
+
+	req, errNewRequest := http.NewRequestWithContext(ctx, method, urlStr, requestBody)
+	if errNewRequest != nil {
+		result.Error = "failed to build request"
+		h.updateAuthProbeStatus(ctx, auth, result, item.UpdateStatus)
+		return result
+	}
+
+	for key, value := range reqHeaders {
+		if strings.EqualFold(key, "host") {
+			hostOverride = strings.TrimSpace(value)
+			continue
+		}
+		req.Header.Set(key, value)
+	}
+	if h != nil && h.authManager != nil && auth != nil {
+		if errPrepare := h.authManager.PrepareHttpRequest(ctx, auth, req); errPrepare != nil {
+			result.Error = fmt.Sprintf("failed to prepare request: %v", errPrepare)
+			h.updateAuthProbeStatus(ctx, auth, result, item.UpdateStatus)
+			return result
+		}
+	}
+	if hostOverride != "" {
+		req.Host = hostOverride
+	}
+
+	httpClient := &http.Client{
+		Timeout: defaultAPICallTimeout,
+	}
+	httpClient.Transport = h.apiCallTransport(auth)
+
+	resp, errDo := httpClient.Do(req)
+	if errDo != nil {
+		log.WithError(errDo).Debug("management batch APICall request failed")
+		result.Error = "request failed"
+		h.updateAuthProbeStatus(ctx, auth, result, item.UpdateStatus)
+		return result
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("response body close error: %v", errClose)
+		}
+	}()
+
+	respBody, errReadAll := io.ReadAll(resp.Body)
+	if errReadAll != nil {
+		result.Error = "failed to read response"
+		h.updateAuthProbeStatus(ctx, auth, result, item.UpdateStatus)
+		return result
+	}
+
+	result.StatusCode = resp.StatusCode
+	result.Header = resp.Header
+	result.Body = string(respBody)
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		result.Status = "ok"
+	} else {
+		result.Error = fmt.Sprintf("upstream returned status %d", resp.StatusCode)
+	}
+	h.updateAuthProbeStatus(ctx, auth, result, item.UpdateStatus)
+	return result
+}
+
+func (h *Handler) authByIdentifier(authIndex, name string) *coreauth.Auth {
+	if auth := h.authByIndex(authIndex); auth != nil {
+		return auth
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || h == nil || h.authManager == nil {
+		return nil
+	}
+	if auth, ok := h.authManager.GetByID(name); ok {
+		return auth
+	}
+	for _, auth := range h.authManager.List() {
+		if auth == nil {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(auth.FileName), name) {
+			return auth
+		}
+	}
+	return nil
+}
+
+func authDisplayName(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(auth.FileName); name != "" {
+		return name
+	}
+	return strings.TrimSpace(auth.ID)
+}
+
+func (h *Handler) updateAuthProbeStatus(ctx context.Context, auth *coreauth.Auth, result batchAPICallResult, shouldUpdate bool) {
+	if !shouldUpdate || h == nil || h.authManager == nil || auth == nil {
+		return
+	}
+	updated := auth.Clone()
+	if updated == nil {
+		return
+	}
+	now := time.Now().UTC()
+	updated.UpdatedAt = now
+	updated.NextRetryAfter = time.Time{}
+	if result.Status == "ok" {
+		updated.Status = coreauth.StatusActive
+		updated.StatusMessage = ""
+		updated.Unavailable = false
+		updated.LastError = nil
+		updated.LastRefreshedAt = now
+	} else {
+		updated.Status = coreauth.StatusError
+		updated.StatusMessage = strings.TrimSpace(result.Error)
+		updated.Unavailable = true
+	}
+	_, _ = h.authManager.Update(ctx, updated)
+}
+
+func (h *Handler) resolveBatchCheckTargets(body batchAuthCheckRequest) []*coreauth.Auth {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	if body.IncludeAll {
+		return dedupeAuthTargets(h.authManager.List())
+	}
+
+	seen := make(map[string]struct{})
+	targets := make([]*coreauth.Auth, 0, len(body.AuthIndexes)+len(body.Names))
+	for _, authIndex := range body.AuthIndexes {
+		if auth := h.authByIndex(authIndex); auth != nil {
+			if _, ok := seen[auth.ID]; ok {
+				continue
+			}
+			seen[auth.ID] = struct{}{}
+			targets = append(targets, auth)
+		}
+	}
+	for _, name := range body.Names {
+		if auth := h.authByIdentifier("", name); auth != nil {
+			if _, ok := seen[auth.ID]; ok {
+				continue
+			}
+			seen[auth.ID] = struct{}{}
+			targets = append(targets, auth)
+		}
+	}
+	return targets
+}
+
+func dedupeAuthTargets(auths []*coreauth.Auth) []*coreauth.Auth {
+	if len(auths) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(auths))
+	result := make([]*coreauth.Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
+		}
+		if _, ok := seen[auth.ID]; ok {
+			continue
+		}
+		seen[auth.ID] = struct{}{}
+		result = append(result, auth)
+	}
+	return result
+}
+
+func (h *Handler) checkSingleAuth(ctx context.Context, auth *coreauth.Auth, updateStatus bool) batchAPICallResult {
+	if auth == nil {
+		return batchAPICallResult{Status: "error", Error: "auth not found"}
+	}
+	auth.EnsureIndex()
+	method, targetURL, headers, body, errProbe := buildAuthProbeRequest(auth)
+	if errProbe != nil {
+		result := batchAPICallResult{
+			Name:      authDisplayName(auth),
+			AuthIndex: auth.Index,
+			Status:    "error",
+			Error:     errProbe.Error(),
+		}
+		h.updateAuthProbeStatus(ctx, auth, result, updateStatus)
+		return result
+	}
+
+	item := batchAPICallItem{
+		Name:         authDisplayName(auth),
+		AuthIndexSnake: &auth.Index,
+		Method:       method,
+		URL:          targetURL,
+		Header:       headers,
+		Data:         body,
+		UpdateStatus: updateStatus,
+	}
+	return h.executeBatchAPICallItem(ctx, item)
+}
+
+func buildAuthProbeRequest(auth *coreauth.Auth) (string, string, map[string]string, string, error) {
+	if auth == nil {
+		return "", "", nil, "", fmt.Errorf("auth not found")
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if auth.Attributes != nil {
+		if compat := strings.TrimSpace(auth.Attributes["compat_name"]); compat != "" {
+			baseURL := strings.TrimSpace(auth.Attributes["base_url"])
+			if baseURL == "" {
+				return "", "", nil, "", fmt.Errorf("missing base_url for openai compatible auth")
+			}
+			return http.MethodGet, strings.TrimRight(baseURL, "/") + "/models", map[string]string{}, "", nil
+		}
+	}
+
+	switch providerKey {
+	case "gemini":
+		return http.MethodGet, "https://generativelanguage.googleapis.com/v1beta/models", map[string]string{}, "", nil
+	case "gemini-cli":
+		return http.MethodGet, "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", map[string]string{"Content-Type": "application/json"}, "{}", nil
+	case "claude":
+		return http.MethodGet, "https://api.anthropic.com/v1/models", map[string]string{"anthropic-version": "2023-06-01"}, "", nil
+	case "codex":
+		return http.MethodGet, "https://api.openai.com/v1/models", map[string]string{}, "", nil
+	case "antigravity":
+		return http.MethodGet, "https://api.openai.com/v1/models", map[string]string{}, "", nil
+	case "kimi":
+		return http.MethodGet, "https://api.moonshot.cn/v1/models", map[string]string{}, "", nil
+	case "vertex":
+		projectID := strings.TrimSpace(authAttribute(auth, "project_id"))
+		if projectID == "" && auth.Metadata != nil {
+			if v, ok := auth.Metadata["project_id"].(string); ok {
+				projectID = strings.TrimSpace(v)
+			}
+		}
+		if projectID == "" {
+			return "", "", nil, "", fmt.Errorf("missing project_id for vertex auth")
+		}
+		return http.MethodGet, fmt.Sprintf("https://us-central1-aiplatform.googleapis.com/v1/projects/%s/locations/us-central1/publishers/google/models", projectID), map[string]string{}, "", nil
+	default:
+		if baseURL := strings.TrimSpace(authAttribute(auth, "base_url")); baseURL != "" {
+			return http.MethodGet, strings.TrimRight(baseURL, "/") + "/models", map[string]string{}, "", nil
+		}
+	}
+	return "", "", nil, "", fmt.Errorf("unsupported auth provider: %s", providerKey)
+}
+
+func (h *Handler) collectAuthProbeTargets() []batchAPICallResult {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	auths := h.authManager.List()
+	results := make([]batchAPICallResult, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		auth.EnsureIndex()
+		results = append(results, batchAPICallResult{
+			Name:      authDisplayName(auth),
+			AuthIndex: auth.Index,
+			Status:    string(auth.Status),
+		})
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Name == results[j].Name {
+			return results[i].AuthIndex < results[j].AuthIndex
+		}
+		return strings.ToLower(results[i].Name) < strings.ToLower(results[j].Name)
+	})
+	return results
 }
 
 func firstNonEmptyString(values ...*string) string {

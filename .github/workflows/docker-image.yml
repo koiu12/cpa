@@ -4,10 +4,24 @@ on:
   push:
     tags:
       - v*
+    branches:
+      - main
+      - master
+      - dockerhub
+  workflow_dispatch:
+    inputs:
+      dockerhub_repo:
+        description: 'Docker Hub repository, e.g. yourname/cliproxyapi-custom'
+        required: false
+        default: ''
+      image_tag:
+        description: 'Optional image tag override for manual runs'
+        required: false
+        default: ''
 
 env:
   APP_NAME: CLIProxyAPI
-  DOCKERHUB_REPO: eceasy/cli-proxy-api
+  DOCKERHUB_REPO: ${{ inputs.dockerhub_repo || vars.DOCKERHUB_REPO || 'eceasy/cli-proxy-api' }}
 
 jobs:
   docker_amd64:
@@ -28,7 +42,13 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Generate Build Metadata
         run: |
-          echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "VERSION=${{ inputs.image_tag }}" >> $GITHUB_ENV
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          else
+            echo "VERSION=${GITHUB_REF_NAME}-${GITHUB_SHA::7}" >> $GITHUB_ENV
+          fi
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
       - name: Build and push (amd64)
@@ -63,7 +83,13 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Generate Build Metadata
         run: |
-          echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "VERSION=${{ inputs.image_tag }}" >> $GITHUB_ENV
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          else
+            echo "VERSION=${GITHUB_REF_NAME}-${GITHUB_SHA::7}" >> $GITHUB_ENV
+          fi
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
       - name: Build and push (arm64)
@@ -97,7 +123,13 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Generate Build Metadata
         run: |
-          echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "VERSION=${{ inputs.image_tag }}" >> $GITHUB_ENV
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          else
+            echo "VERSION=${GITHUB_REF_NAME}-${GITHUB_SHA::7}" >> $GITHUB_ENV
+          fi
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
       - name: Create and push multi-arch manifests
