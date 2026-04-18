@@ -62,7 +62,6 @@ jobs:
             COMMIT=${{ env.COMMIT }}
             BUILD_DATE=${{ env.BUILD_DATE }}
           tags: |
-            ${{ env.DOCKERHUB_REPO }}:latest-amd64
             ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}-amd64
 
   docker_arm64:
@@ -103,7 +102,6 @@ jobs:
             COMMIT=${{ env.COMMIT }}
             BUILD_DATE=${{ env.BUILD_DATE }}
           tags: |
-            ${{ env.DOCKERHUB_REPO }}:latest-arm64
             ${{ env.DOCKERHUB_REPO }}:${{ env.VERSION }}-arm64
 
   docker_manifest:
@@ -134,14 +132,15 @@ jobs:
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
       - name: Create and push multi-arch manifests
         run: |
-          docker buildx imagetools create \
-            --tag "${DOCKERHUB_REPO}:latest" \
-            "${DOCKERHUB_REPO}:latest-amd64" \
-            "${DOCKERHUB_REPO}:latest-arm64"
+          docker buildx imagetools inspect "${DOCKERHUB_REPO}:${VERSION}-amd64"
+          docker buildx imagetools inspect "${DOCKERHUB_REPO}:${VERSION}-arm64"
           docker buildx imagetools create \
             --tag "${DOCKERHUB_REPO}:${VERSION}" \
             "${DOCKERHUB_REPO}:${VERSION}-amd64" \
             "${DOCKERHUB_REPO}:${VERSION}-arm64"
+          docker buildx imagetools create \
+            --tag "${DOCKERHUB_REPO}:latest" \
+            "${DOCKERHUB_REPO}:${VERSION}"
       - name: Cleanup temporary tags
         continue-on-error: true
         env:
@@ -173,7 +172,5 @@ jobs:
             return 0
           }
 
-          delete_tag "latest-amd64"
-          delete_tag "latest-arm64"
           delete_tag "${VERSION}-amd64"
           delete_tag "${VERSION}-arm64"
