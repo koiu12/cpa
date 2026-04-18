@@ -126,13 +126,18 @@ func TestBatchCheckAuthFiles_SuccessAndStatusUpdate(t *testing.T) {
 		t.Fatalf("status code = %d, want %d", rec.Code, http.StatusOK)
 	}
 	var resp struct {
-		Items []batchAPICallResult `json:"items"`
+		Items   []batchAPICallResult `json:"items"`
+		Success int                  `json:"success"`
+		Failed  int                  `json:"failed"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
 	if len(resp.Items) != 1 {
 		t.Fatalf("items len = %d, want 1", len(resp.Items))
+	}
+	if resp.Success != 1 || resp.Failed != 0 {
+		t.Fatalf("summary = (%d,%d), want (1,0)", resp.Success, resp.Failed)
 	}
 	if resp.Items[0].Status != "ok" {
 		t.Fatalf("item status = %q, want ok", resp.Items[0].Status)
@@ -191,8 +196,19 @@ func TestBatchCheckAuthFiles_PartialFailure(t *testing.T) {
 
 	h.BatchCheckAuthFiles(ctx)
 
-	if rec.Code != http.StatusMultiStatus {
-		t.Fatalf("status code = %d, want %d", rec.Code, http.StatusMultiStatus)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var resp struct {
+		Items   []batchAPICallResult `json:"items"`
+		Success int                  `json:"success"`
+		Failed  int                  `json:"failed"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Success != 1 || resp.Failed != 1 {
+		t.Fatalf("summary = (%d,%d), want (1,1)", resp.Success, resp.Failed)
 	}
 
 	updatedGood, _ := h.authManager.GetByID(good.ID)
@@ -206,8 +222,8 @@ func TestBatchCheckAuthFiles_PartialFailure(t *testing.T) {
 	if !updatedBad.Unavailable {
 		t.Fatal("expected bad auth unavailable to be true")
 	}
-	if !strings.Contains(updatedBad.StatusMessage, "401") {
-		t.Fatalf("bad auth status message = %q, want contains 401", updatedBad.StatusMessage)
+	if !strings.Contains(updatedBad.StatusMessage, "unauthorized") {
+		t.Fatalf("bad auth status message = %q, want contains unauthorized", updatedBad.StatusMessage)
 	}
 }
 
@@ -234,12 +250,17 @@ func TestBatchCheckAuthFiles_IncludeAll(t *testing.T) {
 		t.Fatalf("status code = %d, want %d", rec.Code, http.StatusOK)
 	}
 	var resp struct {
-		Items []batchAPICallResult `json:"items"`
+		Items   []batchAPICallResult `json:"items"`
+		Success int                  `json:"success"`
+		Failed  int                  `json:"failed"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
 	if len(resp.Items) != 2 {
 		t.Fatalf("items len = %d, want 2", len(resp.Items))
+	}
+	if resp.Success != 2 || resp.Failed != 0 {
+		t.Fatalf("summary = (%d,%d), want (2,0)", resp.Success, resp.Failed)
 	}
 }

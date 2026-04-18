@@ -83,6 +83,12 @@ type batchAPICallResult struct {
 	Body       string              `json:"body,omitempty"`
 }
 
+type batchAPICallResponse struct {
+	Items   []batchAPICallResult `json:"items"`
+	Success int                  `json:"success"`
+	Failed  int                  `json:"failed"`
+}
+
 type batchAuthCheckRequest struct {
 	AuthIndexes  []string `json:"auth_indexes,omitempty"`
 	Names        []string `json:"names,omitempty"`
@@ -269,24 +275,8 @@ func (h *Handler) BatchAPICall(c *gin.Context) {
 		result := h.executeBatchAPICallItem(c.Request.Context(), item)
 		results = append(results, result)
 	}
-
-	status := http.StatusOK
-	hasFailure := false
-	hasSuccess := false
-	for _, item := range results {
-		if item.Status == "ok" {
-			hasSuccess = true
-			continue
-		}
-		hasFailure = true
-	}
-	if hasFailure && hasSuccess {
-		status = http.StatusMultiStatus
-	} else if hasFailure {
-		status = http.StatusBadGateway
-	}
-
-	c.JSON(status, gin.H{"items": results})
+	success, failed := summarizeBatchResults(results)
+	c.JSON(http.StatusOK, batchAPICallResponse{Items: results, Success: success, Failed: failed})
 }
 
 // BatchCheckAuthFiles performs a bulk liveness probe for multiple auth entries.
@@ -307,24 +297,8 @@ func (h *Handler) BatchCheckAuthFiles(c *gin.Context) {
 	for _, auth := range targets {
 		results = append(results, h.checkSingleAuth(c.Request.Context(), auth, body.UpdateStatus))
 	}
-
-	status := http.StatusOK
-	hasFailure := false
-	hasSuccess := false
-	for _, item := range results {
-		if item.Status == "ok" {
-			hasSuccess = true
-			continue
-		}
-		hasFailure = true
-	}
-	if hasFailure && hasSuccess {
-		status = http.StatusMultiStatus
-	} else if hasFailure {
-		status = http.StatusBadGateway
-	}
-
-	c.JSON(status, gin.H{"items": results})
+	success, failed := summarizeBatchResults(results)
+	c.JSON(http.StatusOK, batchAPICallResponse{Items: results, Success: success, Failed: failed})
 }
 
 func (h *Handler) executeBatchAPICallItem(ctx context.Context, item batchAPICallItem) batchAPICallResult {
@@ -457,7 +431,7 @@ func (h *Handler) executeBatchAPICallItem(ctx context.Context, item batchAPICall
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		result.Status = "ok"
 	} else {
-		result.Error = fmt.Sprintf("upstream returned status %d", resp.StatusCode)
+		result.Error = batchResultErrorMessage(resp.StatusCode, result.Body)
 	}
 	h.updateAuthProbeStatus(ctx, auth, result, item.UpdateStatus)
 	return result
@@ -518,6 +492,54 @@ func (h *Handler) updateAuthProbeStatus(ctx context.Context, auth *coreauth.Auth
 		updated.Unavailable = true
 	}
 	_, _ = h.authManager.Update(ctx, updated)
+}
+
+func summarizeBatchResults(results []batchAPICallResult) (success int, failed int) {
+	for _, item := range results {
+		if item.Status == "ok" {
+			success++
+			continue
+		}
+		failed++
+	}
+	return success, failed
+}
+
+func batchResultErrorMessage(statusCode int, body string) string {
+	body = strings.TrimSpace(body)
+	if body != "" {
+		if parsed := parseBatchErrorBody(body); parsed != "" {
+			return parsed
+		}
+	}
+	return fmt.Sprintf("upstream returned status %d", statusCode)
+}
+
+func parseBatchErrorBody(body string) string {
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal([]byte(body), &payload); errUnmarshal != nil {
+		return ""
+	}
+
+	if errorObj, ok := payload["error"].(map[string]any); ok {
+		if code, ok := errorObj["code"].(string); ok && strings.TrimSpace(code) != "" {
+			if message, ok := errorObj["message"].(string); ok && strings.TrimSpace(message) != "" {
+				return strings.TrimSpace(code) + ": " + strings.TrimSpace(message)
+			}
+			return strings.TrimSpace(code)
+		}
+		if message, ok := errorObj["message"].(string); ok && strings.TrimSpace(message) != "" {
+			return strings.TrimSpace(message)
+		}
+	}
+
+	if errorText, ok := payload["error"].(string); ok && strings.TrimSpace(errorText) != "" {
+		return strings.TrimSpace(errorText)
+	}
+	if message, ok := payload["message"].(string); ok && strings.TrimSpace(message) != "" {
+		return strings.TrimSpace(message)
+	}
+	return ""
 }
 
 func (h *Handler) resolveBatchCheckTargets(body batchAuthCheckRequest) []*coreauth.Auth {
